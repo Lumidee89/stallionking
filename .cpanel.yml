@@ -1,0 +1,6 @@
+---
+# cPanel > Git Version Control > "Deploy HEAD Commit" runs these from the repository folder.
+# Point the domain's document root at this repository's public/ folder (see deploy/cpanel-deploy.sh).
+deployment:
+  tasks:
+    - /bin/bash deploy/cpanel-deploy.sh
