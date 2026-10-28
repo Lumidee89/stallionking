@@ -135,28 +135,37 @@
     } catch (e) { stopCamera(); say(cameraError(e) + ' You can take or choose a photo below.'); }
   }
   function toCanvas(source, sw, sh) {
-    const scale = Math.min(1, 1600 / Math.max(sw, sh)); // cap size: faster OCR, less memory
+    // Text must be big enough to read: enlarge small images, but cap big phone photos (speed, memory).
+    const longest = Math.max(sw, sh);
+    const scale = longest < 1400 ? Math.min(2.5, 1800 / longest) : Math.min(1, 2400 / longest);
     canvas.width = Math.round(sw * scale); canvas.height = Math.round(sh * scale);
     ctx.filter = 'grayscale(1) contrast(1.4)';
     ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
     ctx.filter = 'none';
   }
-  async function runOcr() {
+  // fillOnly: a QR code on the same photo already filled some fields; only add what is still empty.
+  async function runOcr({ fillOnly = false, prior = 0 } = {}) {
     if (busy) return; busy = true;
     $('btnCapture').disabled = true; progress.hidden = false; progress.value = 0;
     let worker;
     try {
       say('Loading text reader…'); await loadScript('tesseract');
       worker = await Tesseract.createWorker('eng', 1, { logger: (m) => { if (m.status === 'recognizing text') { progress.value = m.progress; say('Reading document…'); } } });
+      await worker.setParameters({ preserve_interword_spaces: '1' }); // keeps form columns apart
       const result = await Promise.race([
         worker.recognize(canvas),
         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 45000)),
       ]);
       const text = (result.data.text || '').trim();
       if (text.length < 8) throw new Error('empty');
-      await submitScan(text, 'ocr');
+      await submitScan(text, 'ocr', { fillOnly, prior });
     } catch (e) {
       busy = false;
+      if (prior) { // the QR code already filled some fields; keep those
+        closeDialog();
+        notice('warn', `Filled ${prior} field${prior > 1 ? 's' : ''} from the QR code, but the printed text could not be read. Check and complete the rest.`);
+        return;
+      }
       say(e.message === 'timeout' ? 'Reading took too long. Retake the photo closer and in better light.'
         : e.message === 'empty' ? 'No readable text found. Retake the photo closer and in better light.'
         : e.message === 'lib' ? 'The text reader could not load (check your connection). Type the details instead.'
@@ -166,27 +175,41 @@
   }
 
   // ---------- send scanned TEXT to the server for parsing, then fill the form ----------
-  async function submitScan(text, source) {
+  // thenReadText: on a photo, also read the printed text when the QR code lacks the receiver's name or address.
+  async function submitScan(text, source, { fillOnly = false, prior = 0, thenReadText = false } = {}) {
     say('Reading details…');
     try {
-      const res = await post(SK.parseUrl, { data: { text, source } });
+      const res = await post(SK.parseUrl, { data: { text: text.slice(0, 20000), source } });
       const json = await res.json().catch(() => ({}));
-      if (!res.ok) { busy = false; say(httpMessage(res, json)); $('btnCapture').disabled = false; if (mode === 'qr') openQr(); return; }
-      const filled = applyFields(json, source);
+      if (!res.ok) {
+        busy = false;
+        if (thenReadText && res.status === 422) { say('The QR code had no receiver details. Reading the printed text…'); return runOcr(); }
+        if (prior) { closeDialog(); notice('warn', `Filled ${prior} field${prior > 1 ? 's' : ''} from the QR code. Check and complete the rest.`); return; }
+        say(res.status === 422 ? 'No receiver details were found. Make sure the name and address are sharp and well lit, then try again, or type them in.' : httpMessage(res, json));
+        $('btnCapture').disabled = false; if (mode === 'qr') openQr(); return;
+      }
+      const filled = prior + applyFields(json, source, fillOnly);
+      if (thenReadText && (!json.fields?.name || !json.fields?.address)) {
+        busy = false; say('QR code read. Now reading the printed text for the rest…');
+        return runOcr({ fillOnly: true, prior: filled });
+      }
       closeDialog();
-      notice(filled ? 'ok' : 'warn', filled ? `Filled ${filled} field${filled > 1 ? 's' : ''} from the scan. Check them before booking.` : 'The scan had no new details to add.');
+      const missing = ['receiver_name', 'receiver_address'].filter((id) => !$(id).value.trim()).map((id) => $(id).previousElementSibling.textContent.toLowerCase());
+      notice(filled && !missing.length ? 'ok' : 'warn', (filled ? `Filled ${filled} field${filled > 1 ? 's' : ''} from the scan.` : 'The scan had no new details to add.')
+        + (missing.length ? ` We could not read the receiver's ${missing.join(' or ')}; please type ${missing.length > 1 ? 'them' : 'it'} in.` : ' Check them before booking.'));
     } catch (e) {
       busy = false;
       say(e.name === 'AbortError' ? 'The server took too long. Try again.' : 'You appear to be offline. Check your connection and try again.');
     }
   }
-  function applyFields(json, source) {
-    const incoming = []; // [field id, value]
+  function applyFields(json, source, fillOnly = false) {
+    let incoming = []; // [field id, value]
     for (const [group, map] of Object.entries(MAPS)) {
       for (const [k, id] of Object.entries(map)) if (json[group]?.[k]) incoming.push([id, json[group][k]]);
     }
+    if (fillOnly) incoming = incoming.filter(([id]) => !$(id).classList.contains('scanned') && ($(id).tagName === 'SELECT' || !$(id).value.trim()));
     const conflicts = incoming.filter(([id, val]) => $(id).tagName !== 'SELECT' && $(id).value.trim() && $(id).value.trim() !== val);
-    if (conflicts.length && !confirm('Replace the details you already typed with the scanned ones?')) return 0;
+    if (conflicts.length && !fillOnly && !confirm('Replace the details you already typed with the scanned ones?')) return 0;
     for (const [id, val] of incoming) { const el = $(id); el.value = val; el.classList.add('scanned'); el.classList.remove('invalid'); }
     if (incoming.some(([id]) => id.startsWith('receiver_'))) $('receiver_source').value = source;
     if (incoming.some(([id]) => id.startsWith('sender_'))) $('client_id').value = ''; // scanned sender replaces a picked client
@@ -313,7 +336,7 @@
     } catch (_) { /* no QR reader available: fall through to text */ }
     toCanvas(bmp, bmp.width, bmp.height); bmp.close?.();
     $('ocrPreview').src = canvas.toDataURL('image/jpeg', 0.7); $('ocrPreview').hidden = false;
-    if (qr) { busy = true; await submitScan(qr, 'qr'); } else runOcr();
+    if (qr) { busy = true; await submitScan(qr, 'qr', { thenReadText: true }); } else runOcr();
   }
   $('fileInput').addEventListener('change', (e) => {
     const f = e.target.files[0]; e.target.value = '';

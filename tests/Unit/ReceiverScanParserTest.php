@@ -74,4 +74,46 @@ class ReceiverScanParserTest extends TestCase
             $this->assertSame($band, P::weightBand($in), $in);
         }
     }
+
+    /** Real-world QR and photo formats that previously lost the receiver's name and address. */
+    public function test_name_and_address_are_found_in_common_formats(): void
+    {
+        $cases = [
+            'old tracker QR keys' => ['{"r_name":"Ade Bello","r_phone":"08031234567","r_address":"12 Allen Avenue","r_city":"Ikeja"}', 'Ade Bello', '12 Allen Avenue', 'Ikeja'],
+            'camelCase JSON' => ['{"fullName":"Ade Bello","phone":"08031234567","streetAddress":"12 Allen Avenue","city":"Ikeja"}', 'Ade Bello', '12 Allen Avenue', 'Ikeja'],
+            'first/last name JSON' => ['{"first_name":"Ade","last_name":"Bello","address_line1":"12 Allen Avenue, Ikeja, Lagos"}', 'Ade Bello', '12 Allen Avenue, Ikeja, Lagos', 'Ikeja'],
+            'nested address JSON' => ['{"receiver":{"name":"Ade Bello","address":{"street":"12 Allen Avenue","city":"Ikeja"}}}', 'Ade Bello', '12 Allen Avenue', 'Ikeja'],
+            'vCard with N only and iPhone ADR' => ["BEGIN:VCARD\nVERSION:3.0\nN:Bello;Ade;;;\nTEL;type=CELL:0803 123 4567\nitem1.ADR;type=HOME:;;12 Allen Avenue;Ikeja;Lagos;;Nigeria\nEND:VCARD", 'Ade Bello', '12 Allen Avenue', 'Ikeja'],
+            'one-line text QR' => ['Ade Bello, 12 Allen Avenue, Ikeja, Lagos, 08031234567', 'Ade Bello', '12 Allen Avenue', 'Ikeja'],
+            'semicolon text QR' => ['Name: Ade Bello; Phone: 08031234567; Address: 12 Allen Avenue, Ikeja', 'Ade Bello', '12 Allen Avenue, Ikeja', 'Ikeja'],
+            'value on the next line' => ["Receiver\nName:\nAde Bello\nAddress:\n12 Allen Avenue\nIkeja, Lagos\nPhone: 0803 123 4567", 'Ade Bello', '12 Allen Avenue', 'Ikeja'],
+            'OCR slips' => ["Customer Name; Ade Bello\nAdress: 12 Allen Avenue\nPhone No. 0803 123 4567", 'Ade Bello', '12 Allen Avenue', ''],
+            'two fields on one line' => ["Name: Ade Bello      Phone: 0803 123 4567\nAddress: 12 Allen Avenue, Ikeja, Lagos", 'Ade Bello', '12 Allen Avenue, Ikeja, Lagos', 'Ikeja'],
+            'no street word, OCR noise' => ["| Ade Bello\nPlot 5, Lekki Phase 1\nLagos\n0803 123 4567", 'Ade Bello', 'Plot 5, Lekki Phase 1', 'Lagos'],
+            'title line PARCEL' => ["PARCEL\n\nNgozi Eze\n\nPlot 14, Gwarinpa Estate\nAbuja, FCT\n\n0813 447 2201", 'Ngozi Eze', 'Plot 14, Gwarinpa Estate', 'Abuja'],
+            'name of receiver' => ["Name of Receiver: Ade Bello\nHome Address: 12 Allen Avenue", 'Ade Bello', '12 Allen Avenue', ''],
+            'label without colon' => ["Name Ade Bello\nAddress 12 Allen Avenue", 'Ade Bello', '12 Allen Avenue', ''],
+        ];
+        foreach ($cases as $label => [$text, $name, $address, $city]) {
+            $f = P::parse($text)['fields'];
+            $this->assertSame($name, $f['name'], "$label: name");
+            $this->assertSame($address, $f['address'], "$label: address");
+            $this->assertSame($city, $f['city'], "$label: city");
+        }
+    }
+
+    public function test_sender_details_never_leak_into_the_receiver(): void
+    {
+        $r = P::parse("Sender: Shop Ltd\nSender Phone: 08031111111\nSender Address: 1 Broad Street\nReceiver: Ade Bello\nReceiver Address: 12 Allen Avenue\nReceiver Phone: 08032222222");
+        $this->assertSame('Ade Bello', $r['fields']['name']);
+        $this->assertSame('12 Allen Avenue', $r['fields']['address']);
+        $this->assertSame('08032222222', $r['fields']['phone']);
+        $this->assertSame('Shop Ltd', $r['sender']['name']);
+    }
+
+    public function test_long_ocr_text_is_accepted(): void
+    {
+        $r = P::parse(str_repeat("Terms and conditions apply to every shipment.\n", 150) . "Receiver\nName: Ade Bello\nAddress: 12 Allen Avenue");
+        $this->assertSame('Ade Bello', $r['fields']['name']);
+    }
 }
